@@ -1,5 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
+import TelegramBot from "node-telegram-bot-api";
+import cron from "node-cron";
 
 dotenv.config();
 
@@ -1409,6 +1411,372 @@ app.get("/market-context", async (req, res) => {
     });
   }
 });
+// ===============================
+// STOCK SAGE TELEGRAM ALERT BOT
+// ===============================
+
+const ENABLE_TELEGRAM_BOT =
+  String(process.env.ENABLE_TELEGRAM_BOT || "false") === "true";
+
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+const CHECK_INTERVAL_MINUTES = Number(
+  process.env.CHECK_INTERVAL_MINUTES || 15
+);
+
+const STOCK_BACKEND_URL =
+  process.env.STOCK_BACKEND_URL || `http://localhost:${PORT}`;
+
+// Beta storage only.
+// Watchlists reset if the Render service restarts.
+// Later, replace this with a database.
+const telegramWatchlists = new Map();
+
+function getTelegramUserWatchlist(chatId) {
+  if (!telegramWatchlists.has(chatId)) {
+    telegramWatchlists.set(chatId, []);
+  }
+
+  return telegramWatchlists.get(chatId);
+}
+
+function normalizeTelegramDecision(decision) {
+  if (decision === "Buy") return "Executable Long";
+  if (decision === "Sell") return "Executable Short";
+  if (decision === "Watchlist only") return "Watchlist Only";
+  return "Avoid";
+}
+
+function getTelegramMainPrice(analysis) {
+  return (
+    analysis?.timeframes?.["5min"]?.livePrice ??
+    analysis?.timeframes?.["15min"]?.livePrice ??
+    analysis?.timeframes?.["30min"]?.livePrice ??
+    null
+  );
+}
+
+function getTelegramNoTradeZone(analysis) {
+  const fiveMin = analysis?.timeframes?.["5min"];
+  const support = fiveMin?.levels?.nearSupport ?? null;
+  const resistance = fiveMin?.levels?.nearResistance ?? null;
+
+  if (support === null || resistance === null) return "Unavailable";
+
+  return `${support}–${resistance}`;
+}
+
+function getTelegramLongTrigger(analysis) {
+  return analysis?.timeframes?.["5min"]?.levels?.nearResistance ?? null;
+}
+
+function getTelegramInvalidation(analysis) {
+  return (
+    analysis?.timeframes?.["5min"]?.tradePlan?.long?.invalidationLevel ??
+    analysis?.timeframes?.["5min"]?.levels?.nearSupport ??
+    null
+  );
+}
+
+function getTelegramPositionSize(analysis) {
+  if (analysis?.finalDecision !== "Buy" && analysis?.finalDecision !== "Sell") {
+    return 0;
+  }
+
+  return analysis?.preferredPlan?.suggestedUnits ?? 0;
+}
+
+async function alertFetchJson(url) {
+  const response = await fetch(url);
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || `HTTP ${response.status}`);
+  }
+
+  return data;
+}
+
+async function getTelegramMarketContext() {
+  return alertFetchJson(`${STOCK_BACKEND_URL}/market-context`);
+}
+
+async function getTelegramTickerAnalysis({ ticker, accountSize, riskPercent }) {
+  const params = new URLSearchParams({
+    ticker,
+    accountSize: String(accountSize),
+    riskPercent: String(riskPercent)
+  });
+
+  return alertFetchJson(
+    `${STOCK_BACKEND_URL}/multi-timeframe-analysis?${params.toString()}`
+  );
+}
+
+function buildTelegramAlertMessage({
+  ticker,
+  analysis,
+  marketContext,
+  manual = false
+}) {
+  const decision = normalizeTelegramDecision(analysis.finalDecision);
+  const price = getTelegramMainPrice(analysis);
+  const noTradeZone = getTelegramNoTradeZone(analysis);
+  const longTrigger = getTelegramLongTrigger(analysis);
+  const invalidation = getTelegramInvalidation(analysis);
+  const positionSize = getTelegramPositionSize(analysis);
+
+  const trends = analysis.multiTimeframeSummary?.trends ?? {};
+  const signals = analysis.multiTimeframeSummary?.signals ?? {};
+  const rejectionReasons = analysis.rejectionReasons ?? [];
+
+  const marketBias = marketContext?.marketBias ?? "Unavailable";
+  const riskTone = marketContext?.riskTone ?? "Unavailable";
+  const techConfirmation = marketContext?.techConfirmation ?? "Unavailable";
+
+  const reason =
+    rejectionReasons.length > 0
+      ? rejectionReasons.slice(0, 2).join("\n")
+      : analysis.finalReason ?? "No reason available.";
+
+  const heading = manual ? `${ticker} Manual Check` : `${ticker} Alert`;
+
+  const action =
+    decision === "Executable Long" || decision === "Executable Short"
+      ? "Review setup before acting"
+      : "Wait";
+
+  return `
+${heading} — ${decision}
+
+Market Context:
+Bias: ${marketBias}
+Risk Tone: ${riskTone}
+Tech: ${techConfirmation}
+
+Price: ${price ?? "Unavailable"}
+
+5min: ${trends["5min"] ?? "Unknown"} / ${signals["5min"] ?? "Unknown"}
+15min: ${trends["15min"] ?? "Unknown"} / ${signals["15min"] ?? "Unknown"}
+30min: ${trends["30min"] ?? "Unknown"} / ${signals["30min"] ?? "Unknown"}
+
+Reason:
+${reason}
+
+No-trade zone: ${noTradeZone}
+Long trigger: ${longTrigger ?? "Unavailable"}
+Invalidation: ${invalidation ?? "Unavailable"}
+Position size: ${positionSize} shares
+
+Action: ${action}
+
+Educational decision-support only. Not financial advice.
+`.trim();
+}
+
+async function startTelegramAlertBot() {
+  if (!ENABLE_TELEGRAM_BOT) {
+    console.log("Telegram alert bot disabled.");
+    return;
+  }
+
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.warn("ENABLE_TELEGRAM_BOT=true but TELEGRAM_BOT_TOKEN is missing.");
+    return;
+  }
+
+  const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+
+  async function runCheckForWatchItem(chatId, item, manual = false) {
+    const marketContext = await getTelegramMarketContext();
+
+    const analysis = await getTelegramTickerAnalysis({
+      ticker: item.ticker,
+      accountSize: item.accountSize,
+      riskPercent: item.riskPercent
+    });
+
+    const newDecision = normalizeTelegramDecision(analysis.finalDecision);
+
+    const shouldSend =
+      manual ||
+      item.lastDecision === null ||
+      item.lastDecision !== newDecision;
+
+    item.lastDecision = newDecision;
+    item.lastCheckedAt = new Date().toISOString();
+
+    if (shouldSend) {
+      const message = buildTelegramAlertMessage({
+        ticker: item.ticker,
+        analysis,
+        marketContext,
+        manual
+      });
+
+      await bot.sendMessage(chatId, message);
+    }
+  }
+
+  bot.onText(/\/start/, async msg => {
+    const chatId = msg.chat.id;
+
+    await bot.sendMessage(
+      chatId,
+      `
+Welcome to Stock Sage Alerts.
+
+Commands:
+/watch MSFT 1000 1
+/check MSFT
+/status
+/unwatch MSFT
+/help
+
+Educational decision-support only. Not financial advice.
+`.trim()
+    );
+  });
+
+  bot.onText(/\/help/, async msg => {
+    const chatId = msg.chat.id;
+
+    await bot.sendMessage(
+      chatId,
+      `
+Commands:
+
+/watch TICKER ACCOUNT_SIZE RISK_PERCENT
+Example: /watch MSFT 1000 1
+
+/check TICKER
+Example: /check MSFT
+
+/status
+Shows your watchlist.
+
+/unwatch TICKER
+Example: /unwatch MSFT
+`.trim()
+    );
+  });
+
+  bot.onText(
+    /\/watch\s+([A-Za-z]+)\s+(\d+(\.\d+)?)\s+(\d+(\.\d+)?)/,
+    async (msg, match) => {
+      const chatId = msg.chat.id;
+      const ticker = match[1].toUpperCase();
+      const accountSize = Number(match[2]);
+      const riskPercent = Number(match[4]);
+
+      const list = getTelegramUserWatchlist(chatId);
+
+      if (list.length >= 1) {
+        await bot.sendMessage(
+          chatId,
+          "Beta limit: one ticker per user for now. Use /unwatch first to change ticker."
+        );
+        return;
+      }
+
+      list.push({
+        ticker,
+        accountSize,
+        riskPercent,
+        lastDecision: null,
+        lastCheckedAt: null
+      });
+
+      await bot.sendMessage(
+        chatId,
+        `Watching ${ticker}. Account: ${accountSize}. Risk: ${riskPercent}%. Checks every ${CHECK_INTERVAL_MINUTES} minutes.`
+      );
+
+      try {
+        await runCheckForWatchItem(chatId, list[0], true);
+      } catch (error) {
+        await bot.sendMessage(chatId, `Initial check failed: ${error.message}`);
+      }
+    }
+  );
+
+  bot.onText(/\/unwatch\s+([A-Za-z]+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const ticker = match[1].toUpperCase();
+
+    const list = getTelegramUserWatchlist(chatId);
+    const filtered = list.filter(item => item.ticker !== ticker);
+
+    telegramWatchlists.set(chatId, filtered);
+
+    await bot.sendMessage(chatId, `Stopped watching ${ticker}.`);
+  });
+
+  bot.onText(/\/status/, async msg => {
+    const chatId = msg.chat.id;
+    const list = getTelegramUserWatchlist(chatId);
+
+    if (!list.length) {
+      await bot.sendMessage(
+        chatId,
+        "No tickers watched. Use /watch MSFT 1000 1"
+      );
+      return;
+    }
+
+    const lines = list.map(
+      item =>
+        `${item.ticker} | Last decision: ${
+          item.lastDecision ?? "Not checked yet"
+        } | Last checked: ${item.lastCheckedAt ?? "Never"}`
+    );
+
+    await bot.sendMessage(chatId, lines.join("\n"));
+  });
+
+  bot.onText(/\/check\s+([A-Za-z]+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const ticker = match[1].toUpperCase();
+
+    const list = getTelegramUserWatchlist(chatId);
+    const item = list.find(watchItem => watchItem.ticker === ticker);
+
+    if (!item) {
+      await bot.sendMessage(
+        chatId,
+        `You are not watching ${ticker}. Use /watch ${ticker} 1000 1`
+      );
+      return;
+    }
+
+    await bot.sendMessage(chatId, `Checking ${ticker} now...`);
+
+    try {
+      await runCheckForWatchItem(chatId, item, true);
+    } catch (error) {
+      await bot.sendMessage(chatId, `Check failed: ${error.message}`);
+    }
+  });
+
+  cron.schedule(`*/${CHECK_INTERVAL_MINUTES} * * * *`, async () => {
+    for (const [chatId, list] of telegramWatchlists.entries()) {
+      for (const item of list) {
+        try {
+          await runCheckForWatchItem(chatId, item, false);
+        } catch (error) {
+          console.error(
+            `Scheduled check failed for ${chatId} ${item.ticker}:`,
+            error.message
+          );
+        }
+      }
+    }
+  });
+
+  console.log("Telegram alert bot enabled.");
+}
+
+startTelegramAlertBot();
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
