@@ -1289,7 +1289,126 @@ app.get("/multi-timeframe-analysis", async (req, res) => {
     });
   }
 });
+app.get("/market-context", async (req, res) => {
+  try {
+    const accountSize =
+      safeNumber(req.query.accountSize) || DEFAULT_ACCOUNT_SIZE;
 
+    const riskPercent =
+      safeNumber(req.query.riskPercent) || DEFAULT_RISK_PERCENT;
+
+    const interval = String(req.query.interval || "15min").trim();
+
+    const marketTickers = ["SPY", "QQQ", "XLK"];
+
+    const results = [];
+
+    for (const ticker of marketTickers) {
+      const result = await analyseTimeframe({
+        ticker,
+        interval,
+        accountSize,
+        riskPercent
+      });
+
+      results.push(result);
+    }
+
+    const context = {};
+
+    for (const result of results) {
+      context[result.ticker] = {
+        status: result.status,
+        livePrice: result.livePrice ?? null,
+        trend: result.trend ?? "Unknown",
+        signal: result.signal ?? "Unknown",
+        tradeQuality: result.tradeQuality ?? "Unknown",
+        rsi: result.indicators?.rsi ?? null,
+        ema20: result.indicators?.ema20 ?? null,
+        ema50: result.indicators?.ema50 ?? null,
+        vwap: result.indicators?.vwap ?? null,
+        macdHistogram: result.indicators?.histogram ?? null,
+        relativeVolume: result.volume?.relativeVolume ?? null,
+        volumeTrend: result.volume?.volumeTrend ?? "Unknown",
+        support: result.levels?.nearSupport ?? null,
+        resistance: result.levels?.nearResistance ?? null,
+        dataQuality: result.dataQuality?.status ?? "unknown"
+      };
+    }
+
+    const spyTrend = context.SPY?.trend;
+    const qqqTrend = context.QQQ?.trend;
+    const xlkTrend = context.XLK?.trend;
+
+    const bullishCount = [spyTrend, qqqTrend, xlkTrend].filter(
+      trend => trend === "Bullish"
+    ).length;
+
+    const bearishCount = [spyTrend, qqqTrend, xlkTrend].filter(
+      trend => trend === "Bearish"
+    ).length;
+
+    let marketBias = "Mixed/Unclear";
+    let riskTone = "Neutral";
+
+    if (bullishCount >= 2) {
+      marketBias = "Risk-On Growth";
+      riskTone = "Supportive";
+    }
+
+    if (bearishCount >= 2) {
+      marketBias = "Defensive/Risk-Off";
+      riskTone = "Weak";
+    }
+
+    const allDataComplete = results.every(result => {
+      return result.dataQuality?.status === "complete";
+    });
+
+    const techConfirmation =
+      context.QQQ?.trend === "Bullish" &&
+      context.XLK?.trend === "Bullish"
+        ? "Supportive for mega-cap tech longs"
+        : context.QQQ?.trend === "Bearish" &&
+          context.XLK?.trend === "Bearish"
+        ? "Negative for mega-cap tech longs"
+        : "Mixed/unclear for mega-cap tech";
+
+    const longSupportive =
+      riskTone === "Supportive" &&
+      techConfirmation === "Supportive for mega-cap tech longs";
+
+    const longContradictory =
+      riskTone === "Weak" ||
+      techConfirmation === "Negative for mega-cap tech longs";
+
+    res.json({
+      status: "success",
+      interval,
+      allDataComplete,
+      marketBias,
+      riskTone,
+      techConfirmation,
+      longSupportive,
+      longContradictory,
+      context,
+      rules: {
+        dayTradingUse:
+          "Use SPY for broad market confirmation, QQQ for growth/mega-cap tech confirmation, and XLK for technology-sector confirmation.",
+        capitalProtection:
+          "Supportive market context cannot override a rejected ticker setup. Weak market context should reduce confidence or block aggressive longs."
+      },
+      source: "Twelve Data time_series with internal indicator calculations"
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Failed to fetch market context",
+      details: error.message
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
